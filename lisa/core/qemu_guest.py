@@ -1,0 +1,319 @@
+"""
+    QEMU guest manipulation utils.
+"""
+
+# from asyncio import exceptions
+import os
+import time
+import shutil
+import pexpect
+import logging
+
+from lisa.config import logging_config, images
+
+logging.config.dictConfig(logging_config)
+log = logging.getLogger()
+
+
+class QEMUGuest():
+    """QEMU guest handling.
+    :param file: Targeted binary to emulate.
+    """
+
+    count = 0
+
+    def __init__(self, file):
+        self._arch = file.arch
+        self._bit = int(file.bit)
+        self._endian = file.endian
+        self._file_name = file.name
+        self._file = file
+        self._is_running = False
+        self._proc = None
+        self._fs = None
+
+        if self._arch not in images:
+            log.critical(
+                'Image for target architecture not present in config.'
+            )
+            return
+
+        # fork image
+        base_fs = images[self._arch]['rootfs']
+        self._fs = f'{self._file.data_dir}/rootfs'
+        shutil.copy(base_fs, self._fs)
+
+        # copy elf binary to image
+        log.info(f'Copying {file.name} to rootfs.')
+        os.system(
+            'e2cp -G 0 -O 0 -P 755 '
+            f'{file.path} {self._fs}:/root/analyzed_bin'
+        )
+
+        run = images[self._arch]['run']
+        self._run_cmd = f'{run} {self._file.data_dir}/rootfs'
+        self._prompt = images[self._arch]['prompt']
+
+        QEMUGuest.count += 1
+
+    @property
+    def is_running(self):
+        """Guest is running - boolean."""
+        return self._is_running
+
+    @property
+    def process(self):
+        """Pexpect spawned process."""
+        return self._proc
+
+    def send_command(self, command):
+        """Sends command to guest VM and returns it's output.
+        :param command: String containing desired commmand.
+        :returns: Command's output inside VM.
+        """
+        if not self._is_running:
+            return None
+        
+        # some architectures do not support commands with more than 16 digits
+        n=12
+        chunks = [command[i:i+n] for i in range(0, len(command), n)]
+        for chunk in chunks:
+            self._proc.sendline(chunk+'\\')
+
+        # self._proc.sendline(command)
+        self._proc.sendline(' ')
+        try:
+            self._proc.expect(self._prompt)
+        except:
+            print("[WARNING] Expecting "+self._prompt)
+        return self._proc.before
+
+    def start_vm(self, disable_ipv6=True):
+        """Starts guest VM.
+        :param: Disable IPv6 on eth0.
+        """
+
+        log.info(
+            f'Requested: {self._arch}, {self._bit}-bit, {self._endian} endian.'
+        )
+
+        self._proc = pexpect.spawn(
+            self._run_cmd, encoding='utf-8', timeout=self._file.exec_time+50
+        )
+        self._proc.logfile = open(
+            f'{self._file.data_dir}/machine.log', 'w', encoding='utf-8'
+        )
+
+        # login
+        self._proc.expect('login: ')
+        self._proc.sendline('root')
+        self._proc.expect('[pP]assword: ')
+        self._proc.sendline('root')
+
+        self._proc.expect(self._prompt)
+
+        self._is_running = True
+        
+        if disable_ipv6:
+            self.send_command(
+                'echo 1 > /proc/sys/net/ipv6/conf/eth0/disable_ipv6 &'
+            )
+        
+
+    def run_and_analyze_custom(self, exec_time, capture_pcap=True):
+        """Runs targeted binary and monitors through
+        Systemtap .ko module.
+        :param exec_time: Time of execution.
+        :param capture_pcap: Run tcpdump and capture pcap.
+        """
+        log.debug('Starting analysis module and target binary.')
+
+        self.send_command('tcpdump -U -i eth0 -w /stap/capture.pcap &')
+
+        time.sleep(1)
+
+        command = (
+            f'staprun -c /stap/lisa.sh '
+            '/stap/lisa.ko > /stap/behav.out &'
+        )
+        self.send_command(command)
+
+        self.send_command('perl /root/analyzed_bin &')
+        self.send_command('sh /root/analyzed_bin &')
+
+        line_count = 0
+        line_count1 = 0
+        line_count2 = 0
+    
+        # execution time (5 minutes)
+        time.sleep(20)
+
+        self.extract_output(True)
+        try:
+            pcap = open(f'{self._file.data_dir}/capture.pcap', 'r', encoding='ISO-8859-1')
+
+            for line in pcap:
+                if line != "\n":
+                    line_count += 1
+
+            pcap.close()
+        except:
+            line_count = 0
+
+        try:
+            behav = open(f'{self._file.data_dir}/behav.out', 'r')
+
+            for line in behav:
+                if line != "\n":
+                    line_count1 += 1
+
+            behav.close()
+        except FileNotFoundError:
+            line_count1 = 0
+
+        try:
+            prog = open(f'{self._file.data_dir}/prog.log', 'r', encoding='latin-1')
+
+            for line in prog:
+                if line != "\n":
+                    line_count2 += 1
+
+            prog.close()
+        except:
+            line_count2 = 0
+
+        general_line_count = line_count + line_count1 + line_count2
+
+        ret = 0
+        previous_line = 0
+        while previous_line != general_line_count and ret < 7:
+            previous_line = general_line_count
+            line_count = 0
+            line_count1 = 0
+            line_count2 = 0
+            # execution time
+            time.sleep(3 + exec_time)
+
+            self.extract_output(True)
+            try:
+                pcap = open(f'{self._file.data_dir}/capture.pcap', 'r', encoding='ISO-8859-1')
+
+                for line in pcap:
+                    if line != "\n":
+                        line_count += 1
+
+                pcap.close()
+            except FileNotFoundError:
+                line_count = 0
+
+            try:
+                behav = open(f'{self._file.data_dir}/behav.out', 'r')
+
+                for line in behav:
+                    if line != "\n":
+                        line_count1 += 1
+
+                behav.close()
+            except FileNotFoundError:
+                line_count1 = 0
+
+            try:
+                prog = open(f'{self._file.data_dir}/prog.log', 'r', encoding='latin-1')
+
+                for line in prog:
+                    if line != "\n":
+                        line_count2 += 1
+
+                prog.close()
+            except FileNotFoundError:
+                line_count2 = 0
+
+            ret += 1
+            general_line_count = line_count + line_count1 + line_count2
+
+    def run_and_analyze(self, exec_time, capture_pcap=True):
+        """Runs targeted binary and monitors through
+        Systemtap .ko module.
+        :param exec_time: Time of execution.
+        :param capture_pcap: Run tcpdump and capture pcap.
+        """
+
+        log.debug('Starting analysis module and target binary.')
+
+        self.send_command('tcpdump -i eth0 -w /stap/capture.pcap &')
+
+        time.sleep(1)
+
+        command = (
+            f'staprun -c /stap/lisa.sh '
+            '/stap/lisa.ko > /stap/behav.out &'
+        )
+        self.send_command(command)
+
+        self.send_command('sh /root/analyzed_bin &')
+
+        # execution time
+        time.sleep(3 + exec_time)
+
+    def poweroff_vm(self):
+        """Shutdowns guest VM.""" 
+
+        try:
+            self._proc.sendline('sync')
+            self._proc.sendline(' ')
+            self._proc.expect(self._prompt)
+            self._proc.sendline('poweroff')
+            self._proc.expect(pexpect.EOF)
+        except:
+            print("[ERROR] It cannot be possible to quit")
+
+        self._proc.logfile.close()
+        self._is_running = False
+
+    def extract_pcap(self):
+        extract_pcap = (
+            'e2cp '
+            f'{self._fs}:/stap/capture.pcap '
+            f'{self._file.data_dir}/'
+        )
+        os.system(extract_pcap)
+
+    def extract_output(self, keep_fs=False):
+        """Extracts behav.out, prog.log, capture.pcap from filesystem.
+        :param keep_fs: Do not delete target filesystem snapshotted
+                        during analysis.
+        """
+
+        extract_behav = (
+            'e2cp '
+            f'{self._fs}:/stap/behav.out '
+            f'{self._file.data_dir}/'
+        )
+        os.system(extract_behav)
+
+        extract_progout = (
+            'e2cp '
+            f'{self._fs}:/stap/prog.log '
+            f'{self._file.data_dir}/'
+        )
+        os.system(extract_progout)
+
+        extract_pcap = (
+            'e2cp '
+            f'{self._fs}:/stap/capture.pcap '
+            f'{self._file.data_dir}/'
+        )
+        os.system(extract_pcap)
+
+        log.debug('Behavioral info (behav.out) saved in data directory.')
+
+        if not keep_fs:
+            os.system(f'rm {self._fs}')
+
+    def get_ip(self):
+        """Returns local IP address of VM."""
+        command = 'ifconfig eth0 | awk \'/inet addr/ '
+        command += '{gsub("addr:", "", $2); print $2}\''
+        self._proc.sendline(command)
+        self._proc.expect('10.0.2.*\r\n')
+        return self._proc.after.strip()
