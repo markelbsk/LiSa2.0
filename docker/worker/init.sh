@@ -20,7 +20,14 @@ ip addr
 echo "/etc/hosts"
 cat /etc/hosts
 
+# ip routing proxy
+ip route delete default
+ip route add default via 172.42.0.25
+echo "ip route"
+ip route
+
 echo "/etc/resolv.conf"
 cat /etc/resolv.conf
 
 su - lisa -c "export LC_ALL=C.UTF-8; export LANG=C.UTF-8; celery -A lisa.web_api.tasks worker --loglevel=info --concurrency=1 -n lisa-worker@%h"
+

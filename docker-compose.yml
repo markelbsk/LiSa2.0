@@ -75,6 +75,30 @@ services:
         ipv4_address: 172.42.0.24
     restart: always
 
+  troubleshoot:
+    image: lisa-troubleshoot
+    tty: true
+    privileged: true
+    build:
+      context: .
+      dockerfile: ./docker/proxy/Dockerfile2
+    networks:
+      lisanet:
+        ipv4_address: 172.42.0.26
+
+  proxy:
+    image: lisa-proxy
+    privileged: true
+    tty: true
+    build:
+      context: .
+      dockerfile: ./docker/proxy/Dockerfile
+    cap_add:
+      - NET_ADMIN
+    networks:
+      lisanet:
+        ipv4_address: 172.42.0.25
+
 networks:
   lisanet:
     ipam:
