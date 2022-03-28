@@ -146,7 +146,7 @@ class QEMUGuest():
         line_count2 = 0
     
         # execution time (5 minutes)
-        time.sleep(20)
+        time.sleep(300)
 
         self.extract_output(True)
         try:

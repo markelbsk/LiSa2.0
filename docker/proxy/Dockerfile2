@@ -2,7 +2,9 @@ FROM ubuntu:20.04
  
 # Install updates to base image
 RUN apt-get update -y 
-RUN apt install -y busybox iproute2 inetutils-traceroute
+RUN apt install -y curl iproute2 iputils-ping
 
+ADD ./docker/proxy/init.sh $HOME/init.sh
 
-
+RUN chmod +x init.sh
+CMD ["./init.sh"]
